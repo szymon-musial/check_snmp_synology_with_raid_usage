@@ -6,6 +6,8 @@
 # - Tobias Schenke
 # Modified By:
 # 04.17.2019  Corben Eastman
+# Modified By:
+# 10.09.2023 Szymon Musiał
 #---------------------------------------------------
 # this plugin checks the health of your Synology NAS
 # - System status (Power, Fans)
@@ -114,18 +116,24 @@ usage()
         echo ""
         echo "            -i   			Ignore DSM updates"
         echo ""
-        echo "examples:	./check_snmp_synology -u admin -p 1234 -h nas.intranet -t temperature"
+        echo "            -a [PROTOCOL]     snmwalk: set authentication protocol (MD5|SHA). Default MD5"
+        echo "            -l [LEVEL]        snmwalk: set security level (noAuthNoPriv|authNoPriv|authPriv)"
+        echo "            -x [PROTOCOL]     snmwalk: set privacy protocol (DES|AES)"
+        echo "            -X [PASSPHRASE]   snmwalk: set privacy protocol pass phrase"
+        echo "            -n [volume name]  Volume name (from snmpwalk)"
+        echo ""
+        echo "examples:	./check_snmp_synology -u admin -p 1234 -h nas.intranet -a SHA -x AES -X AES_PASSWD -t raid -n 'Volume 2'"
         echo "	     	./check_snmp_synology -u admin -p 1234 -h nas.intranet -v -t system"
         echo "		./check_snmp_synology -2 public -h nas.intranet -t power"
         echo "		./check_snmp_synology -2 public -h nas.intranet:10161 -t ups"
         exit 3
 }
-
 if [ "$1" == "--help" ]; then
     usage; exit 0
 fi
 
-while getopts 2:W:C:w:c:u:p:h:t:iU OPTNAME; do
+
+while getopts 2:W:C:w:c:u:p:h:t:iUa:l:x:X:n: OPTNAME; do
         case "$OPTNAME" in
 	u)	SNMPUser="$OPTARG";;
         p)	SNMPPassword="$OPTARG";;
@@ -137,8 +145,13 @@ while getopts 2:W:C:w:c:u:p:h:t:iU OPTNAME; do
 	W)	warningTemperature="$OPTARG";;
 	C)	criticalTemperature="$OPTARG";;
 	i)	checkDSMUpdate="no";;
-        t)      checkType=("$OPTARG");;
-        *)      usage;;
+    t)  checkType=("$OPTARG");;
+    a)  a="$OPTARG";;
+   	l)  l="$OPTARG";;
+    x)  x="$OPTARG";;
+    X)  X="$OPTARG";;
+    n)  volumeName="$OPTARG";;
+    *)      usage;;
         esac
 done
 
@@ -179,8 +192,19 @@ else
     if [ "$SNMPVersion" = "2" ] ; then
 	SNMPArgs=" -OQne -v 2c -c $SNMPV2Community -t $SNMPTimeout"
     else
-	SNMPArgs=" -OQne -v 3 -u $SNMPUser -A $SNMPPassword -l authNoPriv -a MD5 -t $SNMPTimeout"
-	if [ ${#SNMPPassword} -lt "8" ] ; then
+    SNMPArgs=" -OQne -v 3 -u $SNMPUser -A $SNMPPassword -a $a -t $SNMPTimeout"
+
+    if [ -n "${l}" ] ; then
+        SNMPArgs="${SNMPArgs} -l ${l}"
+    fi
+    if [ -n "${x}" ] ; then
+        SNMPArgs="${SNMPArgs} -x ${x}"
+    fi
+    if [ -n "${X}" ] ; then
+        SNMPArgs="${SNMPArgs} -X ${X}"
+    fi
+
+    if [ ${#SNMPPassword} -lt "8" ] ; then
 	    echo "snmpwalk:  (The supplied password is too short.)"
 	    exit 1
 	fi
@@ -361,12 +385,32 @@ else
             #storageID[$i]=$(echo "$syno_diskspace" | grep ${storageName[$i]} | cut -d "=" -f1 | rev | cut -d "." -f1 | rev)
             storageID[$i]=$(echo "$syno_diskspace" | grep -i "= \"\?/${storageName[$i]}\"\?" | cut -d "=" -f1 | rev | cut -d "." -f1 | rev)
 
+        done
+        for i in `seq 1 $nbRAID`        
+        do
+            currentRaidName=`echo ${RAIDName[$i]} | tr -d '"'`
+            if [[ $currentRaidName == $volumeName ]] ; then        
+                # indexing starts from 0, not 1 here :(
+                selectedStorageID="${storageID[$i]}"
+                # echo "$i: $currentRaidName; $selectedStorageID"
+                storageID=()
+                storageID[$i]=$selectedStorageID
+            fi    
+        done
+
+        for i in `seq 1 $nbRAID`
+        do
             if [ "${storageID[$i]}" != "" ] ; then
                 storageSize[$i]=$(echo "$syno_diskspace" | grep "$OID_StorageSize.${storageID[$i]}" | cut -d "=" -f2 )
                 storageSizeUsed[$i]=$(echo "$syno_diskspace" | grep "$OID_StorageSizeUsed.${storageID[$i]}" | cut -d "=" -f2 )
                 storageAllocationUnits[$i]=$(echo "$syno_diskspace" | grep "$OID_StorageAllocationUnits.${storageID[$i]}" | cut -d "=" -f2 )
-                storagePercentUsed[$i]=$((${storageSizeUsed[$i]} * 100 / ${storageSize[$i]}))
+                storagePercentUsed[$i]=$((${storageSizeUsed[$i]} * 100 / ${storageSize[$i]})) # Both storageSizeUsed and storageSize are scaled by storageAllocationUnits
                 storagePercentUsedString[$i]="${storagePercentUsed[$i]}% used"
+
+                # Sizes = storageSize * storageAllocationUnits
+                storageAllocationUnitsWithoutString[$i]="$(echo ${storageAllocationUnits[$i]} | cut -d ' ' -f 1 )" #  16384 Bytes -> 16384 (Remove unit string)                
+                storageSizeInBytes[$i]=$((${storageSize[$i]} * ${storageAllocationUnitsWithoutString[$i]}))
+                storageSizeUsedInBytes[$i]=$((${storageSizeUsed[$i]} * ${storageAllocationUnitsWithoutString[$i]}))
 
                 if [ "${storagePercentUsed[$i]}" -gt "$warningStorage" ] ; then
                     if [ "${storagePercentUsed[$i]}" -gt "$criticalStorage" ] ; then
@@ -412,11 +456,29 @@ else
                           for i in `seq 1 $nbDisk`;
                           do
                               echo " ${diskID[$i]} (model:${diskModel[$i]}) status:${diskStatus[$i]} temperature:${diskTemp[$i]}" ;
-                              done ;;
-        "raid")           echo "Number of RAID volume:   $nbRAID" ;
+                          done ;;
+        "raid")           if [[ -n $volumeName ]] ; then
+                            for i in `seq 1 $nbRAID`;
+                            do
+                                # If provided size info -> print out, in multiseries format
+                                if [[ -n "${storageSizeUsedInBytes[$i]}" && -n "${storageSizeInBytes[$i]}" ]] ; then
+                                    echo "${RAIDName[$i]} - used ${storagePercentUsed[$i]}% ($(echo ${storageSizeUsedInBytes[$i]} | numfmt --to=iec)/$(echo ${storageSizeInBytes[$i]} | numfmt --to=iec)) | 'Used [%]'=${storagePercentUsed[$i]}% 'Used [Bytes]'=${storageSizeUsedInBytes[$i]}Bytes " ;
+                                fi
+                            done                            
+                            exit
+                          fi
+
+                          echo "Number of RAID volume:   $nbRAID" ;
                           for i in `seq 1 $nbRAID`;
                           do
-                              echo " ${RAIDName[$i]} status:${RAIDStatus[$i]} ${storagePercentUsedString[$i]}" ;
+                            echo -n " ${RAIDName[$i]} status:${RAIDStatus[$i]} ${storagePercentUsedString[$i]}" ;                 
+                            
+                            # If provided size info -> print out
+                            if [[ -n "${storageSizeUsedInBytes[$i]}" && -n "${storageSizeInBytes[$i]}" ]] ; then
+                                echo " (${storageSizeUsedInBytes[$i]} Bytes) Total ${storageSizeInBytes[$i]}Bytes" ;
+                            else
+                                echo "" ;
+                            fi
                           done ;;
     esac
 
